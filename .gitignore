@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+.env
+.DS_Store
+data/benchmark/videos/*.mp4
+data/benchmark/videos/*.avi
+data/benchmark/videos/*.mkv

@@ -1,0 +1,423 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
+use crate::api_clients::{LlmClient, VlmClient, UnifiedLlmClient};
+use crate::benchmark::data::BenchmarkData;
+use crate::config::Config;
+use crate::error::{MumaTomError, Result};
+use crate::fusion::{FusionModule, FusedInteraction};
+use crate::hypothesis::{HypothesisParser, ParsedHypothesis};
+use crate::inverse_planning::{InversePlanner, PosteriorResult, RankingResult};
+use crate::models::{Question, QuestionType, BenchmarkDataset, EvaluationResult, CategoryAccuracy};
+use tracing::{info, warn, error, instrument};
+
+pub struct BenchmarkRunner {
+    config: Config,
+    vlm: Arc<dyn VlmClient + Send + Sync>,
+    llm: Arc<dyn LlmClient + Send + Sync>,
+    fusion_module: FusionModule,
+    hypothesis_parser: HypothesisParser,
+    inverse_planner: InversePlanner,
+}
+
+impl BenchmarkRunner {
+    pub fn new(config: Config) -> Self {
+        let vlm = Arc::new(crate::api_clients::gemini::GeminiClient::new(
+            config.gemini.api_key.clone(),
+            &config.gemini.model,
+        ).unwrap());
+
+        let openai_client = crate::api_clients::openai::OpenAiClient::new(
+            config.openai.api_key.clone(),
+            &config.openai.model,
+        );
+
+        let gemini_client = crate::api_clients::gemini::GeminiClient::new(
+            config.gemini.api_key.clone(),
+            &config.gemini.model,
+        ).unwrap();
+
+        let llm = Arc::new(UnifiedLlmClient::new(
+            Some(Arc::new(openai_client)),
+            Some(Arc::new(gemini_client)),
+            config.api.requests_per_second,
+        ));
+
+        Self {
+            config,
+            vlm,
+            llm,
+            fusion_module: FusionModule::default(),
+            hypothesis_parser: HypothesisParser::new(),
+            inverse_planner: InversePlanner::default(),
+        }
+    }
+
+    pub async fn run_benchmark(
+        &self,
+        benchmark_data: &BenchmarkDataset,
+    ) -> Result<EvaluationResult> {
+        info!("Starting MuMA-ToM benchmark with {} interactions and {} questions",
+            benchmark_data.interactions.len(),
+            benchmark_data.questions.len()
+        );
+
+        let results = Arc::new(Mutex::new(HashMap::new()));
+        let results_clone = Arc::clone(results);
+
+        let mut handles = Vec::new();
+
+        for question in &benchmark_data.questions {
+            let question_id = question.id.clone();
+            let results = results_clone.clone();
+            let vlm = self.vlm.clone();
+            let llm = self.llm.clone();
+            let fusion_module = self.fusion_module.clone();
+            let hypothesis_parser = self.hypothesis_parser.clone();
+            let inverse_planner = self.inverse_planner.clone();
+
+            let handle = tokio::spawn(async move {
+                let result = Self::process_question(
+                    &question,
+                    benchmark_data,
+                    &vlm,
+                    &llm,
+                    &fusion_module,
+                    &hypothesis_parser,
+                    &inverse_planner,
+                ).await;
+
+                let mut results = results.lock().unwrap();
+                results.insert(question_id.clone(), result);
+                info!("Processed question {}: correct={}", question_id, result.is_correct);
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.map_err(|e| {
+                MumaTomError::Internal(format!("Benchmark task failed: {}", e))
+            })?;
+        }
+
+        Self::compute_evaluation_results(&results, &benchmark_data.questions).await
+    }
+
+    async fn process_question(
+        question: &Question,
+        benchmark_data: &BenchmarkDataset,
+        vlm: &Arc<dyn VlmClient + Send + Sync>,
+        llm: &Arc<dyn LlmClient + Send + Sync>,
+        fusion_module: &FusionModule,
+        hypothesis_parser: &HypothesisParser,
+        inverse_planner: &InversePlanner,
+    ) -> Result<QuestionResult> {
+        let span = info_span!("Processing question {}", question.id);
+
+        let interaction = benchmark_data
+            .interactions
+            .iter()
+            .find(|i| i.id == question.interaction_id)
+            .ok_or_else(|| MumaTomError::Internal(format!(
+                "Interaction not found for question {}",
+                question.interaction_id
+            )))?;
+
+        let fused_interaction = fusion_module.fuse_interaction(interaction).await?;
+        info!(
+            "Fused interaction: {} events (video: {}, text: {})",
+            question.interaction_id,
+            fused_interaction.events.len(),
+            fused_interaction.video_source_count,
+            fused_interaction.text_source_count,
+        );
+
+        let hypotheses = hypothesis_parser
+            .parse_question_hypotheses(question, &*llm)
+            .await?;
+
+        info!("Parsed {} hypotheses for question", hypotheses.len());
+
+        let ranking_result = inverse_planner
+            .rank_hypotheses(&hypotheses, &fused_interaction.events, &fused_interaction.initial_state)
+            .await?;
+
+        let selected_option = ranking_result.best_hypothesis.as_ref()
+            .and_then(|h| h.hypothesis_id.clone());
+
+        let is_correct = selected_option
+            .map(|opt| {
+                opt.starts_with(&question.correct_answer.to_string())
+            })
+            .unwrap_or(false);
+
+        Ok(QuestionResult {
+            question_id: question.id.clone(),
+            is_correct,
+            selected_option,
+            likelihoods: ranking_result.hypotheses,
+            best_hypothesis: ranking_result.best_hypothesis,
+        })
+    }
+
+    async fn compute_evaluation_results(
+        results: &Arc<Mutex<HashMap<String, QuestionResult>>>,
+        questions: &[Question],
+    ) -> Result<EvaluationResult> {
+        let mut total = 0;
+        let mut correct = 0;
+        let mut by_type: HashMap::new();
+
+        for question in questions {
+            let results_map = results.lock().unwrap();
+            if let Some(result) = results_map.get(&question.id) {
+                total += 1;
+                if result.is_correct {
+                    correct += 1;
+                }
+
+                let category = match question.question_type {
+                    QuestionType::Belief => "belief".to_string(),
+                    QuestionType::SocialGoal => "social_goal".to_string(),
+                    QuestionType::BeliefOfGoal => "belief_of_goal".to_string(),
+                };
+
+                by_type
+                    .entry(category.clone())
+                    .or_insert_with(CategoryAccuracy {
+                        total: 0,
+                        correct: 0,
+                        accuracy: 0.0,
+                    });
+            }
+        }
+
+        for (_, acc) in &mut by_type {
+            acc.total = total;
+            acc.correct = correct;
+            acc.accuracy = if acc.total > 0 {
+                acc.correct as f64 / acc.total as f64
+            } else {
+                0.0
+            };
+        }
+
+        let overall_accuracy = if total > 0 {
+            correct as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        Ok(EvaluationResult {
+            total_questions: total,
+            correct,
+            accuracy: overall_accuracy,
+            by_category,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionResult {
+    pub question_id: String,
+    pub is_correct: bool,
+    pub selected_option: Option<String>,
+    pub likelihoods: Vec<PosteriorResult>,
+    pub best_hypothesis: Option<PosteriorResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_evaluation_results_all_correct() {
+        let mut results = HashMap::new();
+        results.insert("q1".to_string(), QuestionResult {
+            question_id: "q1".to_string(),
+            is_correct: true,
+            selected_option: Some("A".to_string()),
+            likelihoods: vec![],
+            best_hypothesis: None,
+        });
+        results.insert("q2".to_string(), QuestionResult {
+            question_id: "q2".to_string(),
+            is_correct: true,
+            selected_option: Some("B".to_string()),
+            likelihoods: vec![],
+            best_hypothesis: None,
+        });
+        results.insert("q3".to_string(), QuestionResult {
+            question_id: "q3".to_string(),
+            is_correct: true,
+            selected_option: Some("C".to_string()),
+            likelihoods: vec![],
+            best_hypothesis: None,
+        });
+
+        let mut questions = vec![
+            Question {
+                id: "q1".to_string(),
+                interaction_id: "i1".to_string(),
+                question_type: QuestionType::Belief,
+                text: "".to_string(),
+                options: vec![],
+                correct_answer: 0,
+            },
+            Question {
+                id: "q2".to_string(),
+                interaction_id: "i1".to_string(),
+                question_type: QuestionType::SocialGoal,
+                text: "".to_string(),
+                options: vec![],
+                correct_answer: 1,
+            },
+            Question {
+                id: "q3".to_string(),
+                interaction_id: "i1".to_string(),
+                question_type: QuestionType::BeliefOfGoal,
+                text: "".to_string(),
+                options: vec![],
+                correct_answer: 2,
+            },
+        ];
+
+        let results = tokio::task::spawn_blocking(async {
+            Self::compute_evaluation_results(&Arc::new(Mutex::new(results)), &questions).await
+        }).await.unwrap();
+
+        assert_eq!(results.total_questions, 3);
+        assert_eq!(results.correct, 3);
+        assert_eq!(results.accuracy, 1.0);
+    }
+
+    #[test]
+    fn test_compute_evaluation_results_mixed() {
+        let mut results = HashMap::new();
+        results.insert("q1".to_string(), QuestionResult {
+            question_id: "q1".to_string(),
+            is_correct: true,
+            selected_option: Some("A".to_string()),
+            likelihoods: vec![],
+            best_hypothesis: None,
+        });
+        results.insert("q2".to_string(), QuestionResult {
+            question_id: "q2".to_string(),
+            is_correct: false,
+            selected_option: Some("A".to_string()),
+            likelihoods: vec![],
+            best_hypothesis: None,
+        });
+        results.insert("q3".to_string(), QuestionResult {
+            question_id: "q3".to_string(),
+            is_correct: false,
+            selected_option: Some("B".to_string()),
+            likelihoods: vec![],
+            best_hypothesis: None,
+        });
+
+        let mut questions = vec![
+            Question {
+                id: "q1".to_string(),
+                interaction_id: "i1".to_string(),
+                question_type: QuestionType::Belief,
+                text: "".to_string(),
+                options: vec![],
+                correct_answer: 0,
+            },
+            Question {
+                id: "q2".to_string(),
+                interaction_id: "i1".to_string(),
+                question_type: QuestionType::SocialGoal,
+                text: "".to_string(),
+                options: vec![],
+                correct_answer: 1,
+            },
+            Question {
+                id: "q3".to_string(),
+                interaction_id: "i1".to_string(),
+                question_type: QuestionType::BeliefOfGoal,
+                text: "".to_string(),
+                options: vec![],
+                correct_answer: 2,
+            },
+        ];
+
+        let results = tokio::task::spawn_blocking(async {
+            Self::compute_evaluation_results(&Arc::new(Mutex::new(results)), &questions).await
+        }).await.unwrap();
+
+        assert_eq!(results.total_questions, 3);
+        assert_eq!(results.correct, 1);
+        assert_eq!(results.accuracy, 0.33333333333333334);
+        assert_eq!(results.by_category.get("belief").unwrap().accuracy, 1.0);
+        assert_eq!(results.by_category.get("social_goal").unwrap().accuracy, 0.0);
+        assert_eq!(results.by_category.get("belief_of_goal").unwrap().accuracy, 0.0);
+    }
+
+    #[test]
+    fn test_evaluation_result_serialization() {
+        let eval = EvaluationResult {
+            total_questions: 10,
+            correct: 7,
+            accuracy: 0.7,
+            by_category: {
+                "belief".to_string() => CategoryAccuracy {
+                    total: 4,
+                    correct: 4,
+                    accuracy: 1.0,
+                },
+                "social_goal".to_string() => CategoryAccuracy {
+                    total: 3,
+                    correct: 2,
+                    accuracy: 0.6666666666667,
+                },
+                "belief_of_goal".to_string() => CategoryAccuracy {
+                    total: 3,
+                    correct: 1,
+                    accuracy: 0.33333333333333334,
+                },
+            },
+        };
+
+        let serialized = serde_json::to_string(&eval).unwrap();
+        let deserialized: EvaluationResult = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.total_questions, 10);
+        assert_eq!(deserialized.correct, 7);
+        assert_eq!(deserialized.accuracy, 0.7);
+    }
+
+    #[tokio::test]
+    async fn test_benchmark_runner_creation() {
+        let config = Config {
+            openai: crate::config::OpenAiConfig {
+                api_key: "sk-test-key".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            gemini: crate::config::GeminiConfig {
+                api_key: "AIza-test-key".to_string(),
+                model: "gemini-1.5-pro".to_string(),
+            },
+            api: crate::config::ApiConfig {
+                timeout_secs: 120,
+                retry_max_attempts: 3,
+                requests_per_second: 10,
+            },
+            caching: crate::config::CachingConfig {
+                enable_llm_cache: true,
+                cache_ttl_secs: 3600,
+            },
+            paths: crate::config::PathsConfig {
+                benchmark_data_path: "./data/benchmark".to_string(),
+                train_data_path: "./data/train".to_string(),
+            },
+        };
+
+        let runner = BenchmarkRunner::new(config);
+        assert_eq!(runner.config.openai.model, "gpt-4");
+        assert_eq!(runner.config.gemini.model, "gemini-1.5-pro");
+    }
+}

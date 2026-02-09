@@ -1,0 +1,77 @@
+[package]
+name = "muma-tom-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of MuMA-ToM benchmark and LIMP model for multi-modal multi-agent Theory of Mind"
+license = "CC-BY-4.0"
+repository = "https://github.com/yourusername/muma-tom-rust"
+keywords = ["theory-of-mind", "multi-agent", "llm", "benchmark", "ai"]
+categories = ["science", "mathematics", "command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+
+# Async traits
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Video/image processing (optional, requires FFmpeg)
+video-rs = { version = "0.10", optional = true }
+image = "0.25"
+
+# LLM/VLM clients
+async-openai = "0.32"
+gemini-rust = "1.7"
+
+# Token counting
+tiktoken-rs = "0.5"
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Retry and rate limiting
+backoff = "0.4"
+tokio-retry = "0.3"
+
+# Caching (optional, for LRU cache)
+lru = "0.12"
+
+# Configuration
+dotenvy = "0.15"
+
+# Bayes integration (for inverse planning)
+bayes-rs = "0.1"
+
+[dev-dependencies]
+# Testing
+mockall = "0.12"
+
+# Test async
+tokio-test = "0.4"
+
+[features]
+default = ["full"]
+full = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
